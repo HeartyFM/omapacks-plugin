@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "heartyfm.omapacks",
+  "name": "OmaPacks · Configuración compartida",
+  "version": "0.2.1",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  },
+  "description": "Instalación inicial del gestor de releases compartidas. No es un actualizador oficial de Omarchy."
+}
