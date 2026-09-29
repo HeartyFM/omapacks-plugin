@@ -16,6 +16,7 @@ def parser():
     p.add_argument('--home',type=Path,help='Hogar explícito para instalación aislada/pruebas')
     sub=p.add_subparsers(dest='command')
     t=sub.add_parser('tui'); t.add_argument('--mode',choices=['install','update'],default='install')
+    t.add_argument('--release-id',type=int,help='Abrir un reporte nuevo tras actualizar el gestor; nunca reutiliza un plan')
     sub.add_parser('status'); sub.add_parser('doctor'); sub.add_parser('releases')
     c=sub.add_parser('configure'); c.add_argument('--repo',required=True); c.add_argument('--public-key',required=True); c.add_argument('--yes',action='store_true'); c.add_argument('--system-file',action='append',default=[]); c.add_argument('--service',action='append',default=[])
     f=sub.add_parser('fetch'); f.add_argument('release_id',type=int)
@@ -86,7 +87,7 @@ def main(argv=None):
         config.require(); client=GitHub(config.data['repository'],config.cache)
         if cmd=='tui':
             from .tui import run
-            return run(config,getattr(args,'mode','install'))
+            return run(config,getattr(args,'mode','install'),release_id=getattr(args,'release_id',None))
         if cmd=='releases': result=client.releases()
         elif cmd=='fetch':
             identity=pin(config.data['repository'],client.release(args.release_id))

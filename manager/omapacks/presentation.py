@@ -3,6 +3,7 @@ from __future__ import annotations
 import curses,os,re,shutil,subprocess,sys,termios,textwrap,tty,unicodedata
 from pathlib import Path
 from .util import Error,clean
+from . import __version__
 
 _context={}
 _printed_rows=0
@@ -56,14 +57,13 @@ def paint(text,role='text'):
 def logo_lines(cols,rows):
     path=Path(os.environ.get('OMARCHY_PATH','/usr/share/omarchy'))/'logo.txt'
     try: lines=path.read_text().splitlines()
-    except OSError: return []
-    return lines if rows>=32 and lines and max(map(cells,lines))<cols else []
+    except OSError: lines=[]
+    return lines if rows>=32 and lines and max(map(cells,lines))<cols else ['OMARCHY']
 
 def context_lines(cols):
     repo=_context.get('repo',''); version=_context.get('version','ninguna')
-    info='Repositorio: '+repo+'  ·  Instalada: '+version
-    if cells(info)<=cols-1: return [info]
-    return [clip('Repositorio: '+repo,cols-1),clip('Instalada: '+version,cols-1)]
+    info='Gestor '+__version__+'  ·  Contenido · Instalada: '+version
+    return [clip('Repositorio: '+repo,cols-1)]+wrap(info,max(1,cols-1))
 
 def header(config=None,installed=None,mode='install',notice=''):
     global _context,_printed_rows
@@ -71,11 +71,13 @@ def header(config=None,installed=None,mode='install',notice=''):
         _context={'repo':clean(config.data.get('repository','sin configurar'),False),
                   'version':clean((installed or {}).get('version','ninguna'),False),'mode':mode,'notice':clean(notice,False)}
     cols,rows=size(); logo=logo_lines(cols,rows)
-    if logo and shutil.which('omarchy-show-logo'):
+    if len(logo)>1 and shutil.which('omarchy-show-logo'):
         subprocess.run(['omarchy-show-logo'],env={**os.environ,'OMARCHY_PATH':os.environ.get('OMARCHY_PATH','/usr/share/omarchy')})
         _printed_rows=len(logo)+3
     else:
         print('\033[2J\033[H',end=''); _printed_rows=0
+        for line in logo: print(paint(line,'brand')); _printed_rows+=1
+        print(); _printed_rows+=1
     for line in wrap('OmaPacks · Configuración compartida',max(1,cols-1)):
         print(paint(line,'brand')); _printed_rows+=1
     for line in context_lines(cols): print(paint(line,'muted')); _printed_rows+=1
@@ -94,12 +96,16 @@ def footer_lines(cols,confirming=False):
     return [full] if cells(full)<cols else [first,'Ctrl+C salir']
 
 def reserve_footer(height,confirming=False):
-    footer=footer_lines(size().columns,confirming)
-    # Gum owns header+rows. Leave a blank line, then small native-style key help.
-    print('\n'*(height+2)+ '\n'.join(paint(line,'muted') for line in footer),end='',flush=True)
-    print(f'\033[{height+1+len(footer)}A\r',end='',flush=True)
+    # gum 2 clears below its cursor on repaint. Keep Spanish navigation in the
+    # stable area above the widget instead of positioning text underneath it.
+    for line in footer_lines(size().columns,confirming): message(line,'muted')
 
-def choose(options,title,default=None,highlights=()):
+def preview_lines(text,width):
+    lines=wrap(' '.join(clean(text).split()),max(1,width))
+    if len(lines)>2: lines=[lines[0],clip(lines[1]+' …',max(1,width))]
+    return lines[:2]
+
+def choose(options,title,default=None,highlights=(),previews=()):
     cols,rows=size(); labels=[]
     for i,value in enumerate(options):
         label=clip(clean(value,False).replace('|','│'),max(8,cols-4))
@@ -109,18 +115,26 @@ def choose(options,title,default=None,highlights=()):
     # ragged rectangles around labels of different lengths.
     width=max(map(cells,labels))
     labels=[label+' '*(width-cells(label)) for label in labels]
+    if previews:
+        labels=[label+('\n'+'\n'.join('  '+line for line in preview_lines(previews[i].replace('|','│'),max(1,cols-6)))+'\n' if i<len(previews) else '') for i,label in enumerate(labels)]
     # Only local index metadata may add ANSI, after all remote text is sanitized.
     labels=[paint(label,'accent') if i in highlights else label for i,label in enumerate(labels)]
-    height=max(1,min(len(labels),8,rows-_printed_rows-len(footer_lines(cols))-4))
-    argv=['gum','choose','--header',clip(title,cols-1),'--height',str(height),'--no-show-help','--no-strip-ansi','--label-delimiter','|','--padding','0 0','--header.background','']
+    available=max(1,rows-_printed_rows-len(footer_lines(cols))-4)
+    row_heights=[1+label.count('\n') for label in labels]
+    height=(len(labels) if sum(row_heights)<=available else max(1,available//max(row_heights))) if previews else max(1,min(len(labels),8,available))
+    argv=['gum','choose','--header',clip(title,cols-1),'--height',str(height),'--no-show-help','--no-strip-ansi','--label-delimiter','|','--padding','0 0','--header.background','','--item.background','']
     # The focused release uses the same selection roles as native gum confirm.
     for component in ('FOREGROUND','BACKGROUND'):
         value=os.environ.get('GUM_CHOOSE_SELECTED_'+component)
         if value and (re.fullmatch(r'#[0-9a-fA-F]{6}',value) or value.isdecimal() and int(value)<256):
             argv+=['--cursor.'+component.lower(),value]
-    if default is not None: argv+=['--selected',labels[default]]
+    delimiter='\x1f' if previews else '\n'
+    if previews: argv+=['--input-delimiter',delimiter]
+    if default is not None:
+        # Kong's list flag uses escaped commas, not CSV quoting.
+        argv+=['--selected',labels[default].replace(',',r'\,')]
     reserve_footer(height)
-    result=subprocess.run(argv,input='\n'.join(label+'|'+str(i) for i,label in enumerate(labels)),text=True,stdout=subprocess.PIPE)
+    result=subprocess.run(argv,input=delimiter.join(label+'|'+str(i) for i,label in enumerate(labels)),text=True,stdout=subprocess.PIPE)
     if result.returncode==130: raise KeyboardInterrupt
     if result.returncode:
         header() # Remove gum's English cancellation message from the finished screen.
@@ -136,12 +150,18 @@ def confirm(message_text,affirmative='Instalar'):
     if result.returncode==130: raise KeyboardInterrupt
     return result.returncode==0
 
-def pager(text,title='Detalles',kind='normal',actions=()):
+def completion_key(key):
+    """Only the final screen interprets any key except Esc/resize as close."""
+    if key=='\x1b': return 'menu'
+    return None if key==curses.KEY_RESIZE else 'close'
+
+def pager(text,title='Detalles',kind='normal',actions=(),*,completion=False,default=0):
     safe=clean(text)
-    def view(screen):
+    def render(screen):
         try: curses.use_default_colors(); curses.curs_set(0)
         except curses.error: pass
-        screen.keypad(True); top=0; selected=0
+        screen.keypad(True); top=0; selected=default
+        if completion: curses.flushinp() # Discard keys typed during installation.
         colors=not os.environ.get('NO_COLOR') and curses.has_colors()
         if colors:
             for n,c in ((1,2),(2,1)):
@@ -162,6 +182,14 @@ def pager(text,title='Detalles',kind='normal',actions=()):
                 button=curses.color_pair(3)
             except (ValueError,curses.error): pass
         brand=curses.color_pair(1) if colors else 0
+        section_style=curses.A_REVERSE|curses.A_BOLD
+        if colors:
+            try:
+                # Same ANSI palette entry as the native Omarchy logo, as a
+                # highlight background instead of colored section text.
+                curses.init_pair(4,16 if curses.COLORS>=256 else 0,2)
+                section_style=curses.color_pair(4)|curses.A_BOLD
+            except curses.error: pass
         heading=(curses.color_pair(2) if colors and kind=='error' else brand)|curses.A_BOLD
         secondary=0 if light_palette() else curses.A_DIM
         while True:
@@ -170,20 +198,42 @@ def pager(text,title='Detalles',kind='normal',actions=()):
                 if 0<=y<rows:
                     try: screen.addstr(y,0,clip(value,cols-1),style)
                     except curses.error: pass
-            logo=logo_lines(cols,rows); y=0
-            if logo:
-                y=1
-                for line in logo: put(y,line,brand); y+=1
-                y+=2
+            y=0
+            logo=logo_lines(cols,rows)
+            for line in logo: put(y,line,brand); y+=1
+            y+=1
             for line in wrap('OmaPacks · Configuración compartida',max(1,cols-1)): put(y,line,brand); y+=1
+            if _context.get('notice'):
+                for line in wrap(_context['notice'],max(1,cols-1)): put(y,line,secondary); y+=1
+            if completion:
+                footer=wrap('Esc para regresar al menú principal de OmaPacks.',max(1,cols-1))
+                success=wrap(title,max(1,cols-3))
+                closing=wrap('Presiona cualquier tecla para cerrar.',max(1,cols-1))
+                extra=wrap(safe,max(1,cols-1)) if safe else []
+                block=len(success)+len(extra)+len(closing)+2
+                middle=y+max(0,(rows-y-len(footer)-block)//2)
+                for i,line in enumerate(success):
+                    value=' '+line+' '
+                    try: screen.addstr(middle+i,max(0,(cols-cells(value))//2),value,section_style)
+                    except curses.error: pass
+                for i,line in enumerate(extra+['']+closing):
+                    try: screen.addstr(middle+len(success)+1+i,max(0,(cols-cells(line))//2),line)
+                    except curses.error: pass
+                for i,line in enumerate(footer): put(rows-len(footer)+i,line,secondary)
+                screen.refresh(); answer=completion_key(screen.get_wch())
+                if answer: return answer
+                continue
             # The release/topic takes the place of repository metadata inside the reader.
             put(y,clip(title,cols-1),heading); y+=2
             height=max(1,rows-y-(6 if actions else 4))
-            lines=wrap(safe,width)
+            lines=[]
+            for paragraph in safe.split('\n'):
+                section=paragraph.startswith('## ')
+                value=' '+paragraph[3:]+' ' if section else paragraph
+                lines.extend((line,section) for line in wrap(value,width))
             top=max(0,min(top,max(0,len(lines)-height)))
-            for i,line in enumerate(lines[top:top+height]):
-                section=bool(line and len(line)<55 and (line.endswith(':') or line.isupper()))
-                put(y+i,line,curses.A_BOLD if section else 0)
+            for i,(line,section) in enumerate(lines[top:top+height]):
+                put(y+i,line,section_style if section else 0)
             end=min(len(lines),top+height)
             progress=f'{top+1}–{end} de {len(lines)}' if len(lines)>height else ''
             put(rows-(5 if actions else 3),progress,secondary)
@@ -197,8 +247,9 @@ def pager(text,title='Detalles',kind='normal',actions=()):
             helptext='↑↓ desplazar   PgUp/PgDn página   Inicio/Fin   Esc volver' if cols>=66 else '↑↓ mover   Inicio/Fin   Esc volver'
             if actions:
                 helptext='↑↓ desplazar   ←→ elegir   Enter continuar'
-            put(rows-2,helptext,secondary); put(rows-1,'Esc retroceder   Ctrl+C salir' if actions else 'q volver   Ctrl+C salir',secondary)
-            screen.refresh(); pressed=screen.getch()
+            put(rows-2,helptext,secondary); put(rows-1,'Esc volver   Ctrl+C salir' if actions else 'q volver   Ctrl+C salir',secondary)
+            screen.refresh(); key=screen.get_wch()
+            pressed=ord(key) if isinstance(key,str) else key
             if pressed in (27,ord('q')): return
             if pressed==3: raise KeyboardInterrupt
             if actions:
@@ -211,6 +262,12 @@ def pager(text,title='Detalles',kind='normal',actions=()):
             elif pressed==curses.KEY_PPAGE: top-=height
             elif pressed in (curses.KEY_HOME,ord('g')): top=0
             elif pressed in (curses.KEY_END,ord('G')): top=max(0,len(lines)-height)
+    def view(screen):
+        # Handle Ctrl+C as a key, like gum, so a terminal process group (including
+        # a namespace supervisor) is not killed before we record cancellation.
+        curses.raw()
+        try: return render(screen)
+        finally: curses.noraw()
     return curses.wrapper(view)
 
 

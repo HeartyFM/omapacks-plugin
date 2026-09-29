@@ -5,6 +5,7 @@ from pathlib import Path
 from .util import Error, Runner, atomic, clean, digest, secure_path, save_json
 from .artifact import unpack
 from .github import Transport
+from .diagnostics import Blocked,issue
 
 class Providers:
     def __init__(self, runner=None, transport=None, package_lock='/var/lib/pacman/db.lck'):
@@ -12,12 +13,75 @@ class Providers:
 
     def installed(self, name):
         r = self.runner.run(['pacman','-Q','--',name], check=False)
-        return r.stdout.strip().split(' ',1)[1] if r.returncode == 0 and ' ' in r.stdout else None
+        if r.returncode==0:
+            parts=r.stdout.strip().split()
+            if len(parts)==2 and parts[0]==name: return parts[1]
+        elif r.returncode==1 and re.fullmatch(r"error: package '"+re.escape(name)+r"' was not found\s*",r.stderr):
+            return None
+        raise Error('No se pudo consultar el paquete instalado '+name+' (pacman -Q). No equivale a paquete ausente.', 'query')
+
+    def repository_info(self,name):
+        r=self.runner.run(['pacman','-Si','--',name],check=False)
+        if r.returncode:
+            if r.returncode==1 and re.fullmatch(r"error: package '"+re.escape(name)+r"' was not found\s*",r.stderr):
+                raise Error('Paquete no disponible en repositorios habilitados: '+name+
+                            '; no se sustituye por AUR. Revisa el nombre y las bases/repositorios habilitados; no se habilitan automáticamente.', 'package_missing')
+            raise Error('Falló la consulta de repositorios para '+name+' (pacman -Si); disponibilidad desconocida. Revisa pacman y sus bases locales.', 'query')
+        actual=re.search(r'^Name\s*:\s*(\S+)',r.stdout,re.M)
+        candidate=re.search(r'^Version\s*:\s*(\S+)',r.stdout,re.M)
+        if not actual or not candidate: raise Error('Respuesta incompleta de pacman -Si para '+name,'query')
+        if actual.group(1)!=name:
+            raise Error('La receta pide '+name+' pero pacman informa '+actual.group(1)+'. Declara el proveedor concreto tras revisar Provides y restricciones de versión.', 'provider_mismatch')
+        return candidate.group(1)
 
     def compare(self, a, b):
         return int(self.runner.run(['vercmp',a,b]).stdout.strip())
 
+    def observe(self,actions):
+        """Read actual state after a partial transaction; never retry its commands."""
+        observed=[]
+        for a in actions:
+            if a['provider']=='preparation': continue
+            row={'provider':a['provider'],'name':a.get('name',a.get('id')),
+                 'before':a.get('before'),'planned':a.get('version'),'actual':None,'state':'unknown'}
+            try:
+                if a['provider'] in ('arch','aur') or a['provider']=='external' and a['format']=='arch':
+                    row['actual']=self.installed(a['name'])
+                elif a['provider']=='flatpak':
+                    r=self.runner.run(['flatpak','info','--'+a['scope'],'--show-commit',a['name']],check=False)
+                    if r.returncode: raise Error('No se pudo determinar el commit Flatpak instalado','query')
+                    row['actual']=r.stdout.strip()
+                else:
+                    observed.append(row); continue
+                row['state']='planned' if row['actual']==row['planned'] else 'before' if row['actual']==row['before'] else 'different'
+            except Error as e: row['diagnostic']=issue(e,row['name'],'recuperación')
+            observed.append(row)
+        return observed
+
     def plan(self, manifest, staging):
+        # Collect independent Arch blockers before staging AUR/downloads or mutating.
+        issues=[]; needed=False
+        for p in manifest.get('packages',[]):
+            if p['provider']!='arch': continue
+            try:
+                current=self.installed(p['name'])
+                if current and self.compare(current,p['version'])>=0: continue
+                needed=True
+                candidate=self.repository_info(p['name'])
+                if self.compare(candidate,p['version'])<0:
+                    raise Error('La base local no satisface '+p['name']+'; revisa una actualización completa con Omarchy','system_update')
+            except Error as e: issues.append(issue(e,p['name']))
+        if needed:
+            if self.package_lock.exists(): issues.append(issue(Error('Pacman está bloqueado por otra operación. No se elimina db.lck.','locked'),'pacman'))
+            try:
+                updates=self.runner.run(['pacman','-Qu'],check=False)
+                if updates.returncode not in (0,1) or updates.stderr.strip(): raise Error('No se pudo consultar actualizaciones de Arch','query')
+                if updates.stdout.strip(): raise Error('Hay actualizaciones pendientes de Arch. Ejecuta la ruta normal «omarchy update» con aprobación y vuelve a calcular el plan.','system_update')
+            except Error as e: issues.append(issue(e,'pacman -Qu'))
+        if issues: raise Blocked(issues)
+        return self._plan(manifest,staging)
+
+    def _plan(self, manifest, staging):
         actions = []; packages = sorted(manifest.get('packages', []),key=lambda p: p['provider']=='flatpak')
         deferred=[]; remotes={}
         arch = []; existing = {}
@@ -51,11 +115,9 @@ class Providers:
                 actions.append({'provider':provider,'name':name,'version':current,'before':current,'action':'keep'})
                 continue
             if provider == 'arch':
-                info = self.runner.run(['pacman','-Si','--',name], check=False)
-                if info.returncode: raise Error('Paquete no disponible en repositorios habilitados: '+name+'; no se sustituye por AUR', 'provider')
-                candidate = re.search(r'^Version\s*:\s*(\S+)',info.stdout,re.M)
-                if not candidate or self.compare(candidate.group(1),p['version']) < 0: raise Error('La base local no satisface '+name+'; revisa una actualización completa con Omarchy', 'system_update')
-                arch.append(name+'='+candidate.group(1))
+                candidate = self.repository_info(name)
+                if self.compare(candidate,p['version']) < 0: raise Error('La base local no satisface '+name+'; revisa una actualización completa con Omarchy', 'system_update')
+                arch.append(name+'='+candidate)
             elif provider == 'aur':
                 stage = Path(staging)/('aur-'+name)
                 if not stage.exists():
@@ -79,7 +141,10 @@ class Providers:
             if updates.returncode not in (0,1): raise Error('No se pudo consultar actualizaciones de Arch')
             if updates.stdout.strip():
                 raise Error('Hay actualizaciones pendientes de Arch. Ejecuta la ruta normal «omarchy update» con aprobación y vuelve a calcular el plan.\n'+clean(updates.stdout), 'system_update')
-            solved = self.runner.run(['pacman','-Sp','--needed','--print-format','%n\t%v','--',*arch]).stdout
+            resolution=self.runner.run(['pacman','-Sp','--needed','--print-format','%n\t%v','--',*arch],check=False)
+            if resolution.returncode:
+                raise Error('Dependencias no resolubles para '+', '.join(arch)+'. La consulta transitiva de pacman falló; revisa la receta y el estado de las bases. No se instaló ningún paquete.','resolution')
+            solved = resolution.stdout
             for row in solved.splitlines():
                 if '\t' not in row: continue
                 name,v = row.split('\t',1)
@@ -88,6 +153,8 @@ class Providers:
                 if FORBIDDEN_PACKAGES.search(name): raise Error('La transacción incluye una dependencia de sistema excluida: '+name)
                 actions.append({'provider':'arch','name':name,'version':v,'before':self.installed(name),'action':'install','requested':any(x.split('=')[0] == name for x in arch)})
             if not any(a['provider']=='arch' and a['action']=='install' for a in actions): raise Error('Pacman no resolvió la transacción')
+            missing={spec.split('=')[0] for spec in arch}-{a['name'] for a in actions if a['provider']=='arch'}
+            if missing: raise Error('La resolución de pacman omitió paquetes solicitados: '+', '.join(sorted(missing)),'resolution')
         actions.extend(remotes.values())
         if deferred: actions.append({'provider':'preparation','name':', '.join(deferred),'version':'pendiente de resolver','action':'replan','reason':'Después de instalar infraestructura/remotes se mostrará otro plan con aplicaciones, runtimes y permisos resueltos.'})
         for a in actions:

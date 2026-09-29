@@ -23,16 +23,16 @@ def sort_releases(rows):
 def asset_identity(a):
     return {k: a.get(k) for k in ('id', 'name', 'size', 'updated_at', 'digest')}
 
-def pin(repo, release):
+def pin(repo, release, names_required=ASSETS):
     assets=release.get('assets',[])
     if not isinstance(assets,list) or any(not isinstance(a,dict) or not isinstance(a.get('name'),str) for a in assets): raise Error('Release existente con metadata de assets inválida', 'incompatible')
     names = [a['name'] for a in assets]
-    if any(names.count(n) != 1 for n in ASSETS):
-        raise Error('Release no instalable: requiere exactamente omapacks.json, omapacks.json.sig y omapacks.tar.gz', 'incompatible')
+    if any(names.count(n) != 1 for n in names_required):
+        raise Error('Release no instalable: requiere exactamente '+', '.join(names_required), 'incompatible')
     for a in assets:
-        if a['name'] in ASSETS and (type(a.get('id')) is not int or a['id']<=0 or type(a.get('size')) is not int or a['size']<=0): raise Error('Asset sin identidad/tamaño válidos', 'incompatible')
+        if a['name'] in names_required and (type(a.get('id')) is not int or a['id']<=0 or type(a.get('size')) is not int or a['size']<=0): raise Error('Asset sin identidad/tamaño válidos', 'incompatible')
     return {'repository': repo, 'release_id': release['id'], 'tag': release['tag_name'],
-            'published_at': release.get('published_at'), 'assets': [asset_identity(next(a for a in release['assets'] if a['name'] == n)) for n in ASSETS]}
+            'published_at': release.get('published_at'), 'assets': [asset_identity(next(a for a in release['assets'] if a['name'] == n)) for n in names_required]}
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl): return None
@@ -99,11 +99,12 @@ def own_token():
     except (OSError, subprocess.TimeoutExpired): return None
 
 class GitHub:
-    def __init__(self, repo, cache, transport=None, max_pages=100):
+    def __init__(self, repo, cache, transport=None, max_pages=100, asset_names=ASSETS):
         self.repo = repository(repo); self.base = 'https://api.github.com/repos/' + self.repo
         self.cache = Path(cache) / (digest(self.repo.encode()) + '.json')
         self.transport = transport or Transport(own_token())
         self.max_pages = max_pages
+        self.asset_names = asset_names
 
     def json(self, url):
         data, headers = self.transport.get(url)
@@ -147,7 +148,7 @@ class GitHub:
         return row
 
     def verify_pin(self, identity):
-        if pin(self.repo, self.release(identity['release_id'])) != identity:
+        if pin(self.repo, self.release(identity['release_id']), self.asset_names) != identity:
             raise Error('La release cambió desde la selección; vuelve a consultar y revisar.', 'changed')
 
     def download(self, identity, directory):

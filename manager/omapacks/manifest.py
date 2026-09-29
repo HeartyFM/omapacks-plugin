@@ -38,18 +38,30 @@ def destination(value, scope='user', kind='file'):
             if value != '.config/mimeapps.list': raise Error('Destino de defaults inválido')
         elif kind == 'omarchy_menu':
             if value != '.config/omarchy/extensions/omarchy-menu.jsonc': raise Error('Destino de menú inválido')
+        elif kind == 'omarchy_shell':
+            if value != '.config/omarchy/shell.json': raise Error('Destino de shell inválido')
+        elif kind == 'omarchy_style':
+            if value != '.config/omarchy/shell.toml': raise Error('Destino de estilo inválido')
+        elif kind == 'qt_shader':
+            if not re.fullmatch(r'\.config/omarchy/plugins/omapacks\.shared\.[a-z0-9_-]+/[A-Za-z0-9_/-]+\.frag\.qsb',value): raise Error('Shader fuera del plugin administrado')
         elif kind == 'hypr_include':
             if value not in ('.config/hypr/hyprland.lua', '.config/hypr/hyprland.conf'): raise Error('Include Hyprland inválido')
-        elif not (value.startswith('.config/omapacks-shared/') or value.startswith('.local/share/omapacks-content/') or re.fullmatch(r'\.local/bin/omapacks-[a-z0-9_-]+', value)):
+        elif not (value.startswith('.config/omapacks-shared/') or value.startswith('.local/share/omapacks-content/') or re.fullmatch(r'\.local/bin/omapacks-[a-z0-9_-]+', value) or re.fullmatch(r'\.config/omarchy/plugins/omapacks\.shared\.[a-z0-9_-]+/[A-Za-z0-9_./-]+',value)):
             raise Error('Destino común fuera del namespace administrado: ' + value)
     else: raise Error('Ámbito inválido')
     return value
 
 def validate(data):
-    fields(data, ('schema','id','version','manager_min','compatibility','modules','packages','files','downloads','operations','checks','migrations','recovery','notes','flatpak_remotes','recipes'), ('schema','id','version','manager_min','compatibility','modules','recovery'))
+    fields(data, ('schema','id','version','manager_min','compatibility','modules','packages','files','downloads','operations','checks','migrations','recovery','notes','flatpak_remotes','recipes','capture_shortcut'), ('schema','id','version','manager_min','compatibility','modules','recovery'))
     if type(data['schema']) is not int or data['schema'] != 1: raise Error('Esquema de manifiesto no compatible')
     string(data['id'], ID); version(data['version']); version(data['manager_min'])
     if version(data['manager_min']) > version(__version__): raise Error('Esta release requiere actualizar el gestor por separado', 'incompatible')
+    if data.get('capture_shortcut') is not None:
+        from .capture_shortcut import validate as capture_validate
+        capture_validate(data['capture_shortcut'])
+        if version(data['manager_min'])<version('0.3.2'): raise Error('Captura tipada requiere manager_min 0.3.2')
+        if data['compatibility'].get('hyprland_format')!='lua': raise Error('Captura tipada requiere Hyprland Lua')
+        if not any(c.get('kind')=='hyprland' and c.get('required') for c in data.get('checks',[])): raise Error('Captura tipada requiere comprobación Hyprland')
     comp = data['compatibility']; fields(comp, ('architectures','omarchy_min','omarchy_max','hyprland_min','hyprland_max','hyprland_format'), ('architectures',))
     strings(comp['architectures'], r'x86_64|aarch64')
     for name in ('omarchy_min','omarchy_max','hyprland_min','hyprland_max'):
@@ -101,24 +113,29 @@ def validate(data):
         relative(f['source'])
         if not f['source'].startswith(('config/','modules/')): raise Error('Origen fuera de config/ o modules/')
         kind = f.get('kind','file')
-        if kind not in ('file','hypr_include','omarchy_menu','xdg_defaults'): raise Error('Tipo de archivo no soportado')
-        if kind!='file' and f['scope']!='user': raise Error('Los includes y el menú son exclusivamente de usuario')
+        if kind not in ('file','hypr_include','omarchy_menu','xdg_defaults','omarchy_shell','omarchy_style','qt_shader'): raise Error('Tipo de archivo no soportado')
+        if kind!='file' and f['scope']!='user': raise Error('Este recurso es exclusivamente de usuario')
         destination(f['target'], f['scope'], kind)
         if f['scope']=='system' and f.get('mode',0o644) not in (0o600,0o644): raise Error('Los archivos de sistema no pueden ser ejecutables')
         if f.get('mode', 0o644) not in (0o600,0o644,0o700,0o755): raise Error('Permisos inválidos')
+        if kind=='qt_shader' and f.get('mode',0o644)!=0o644: raise Error('Un shader no puede ser ejecutable')
         key = (f['scope'], f['target'])
         if key in paths: raise Error('Destino duplicado')
         paths.add(key)
     for d in data.get('downloads', []):
-        fields(d, ('module','id','format','version','architecture','url','sha256','size','target','build','purpose','check','revision'), ('module','id','format','version','architecture','url','sha256','size','purpose'))
+        fields(d, ('module','id','format','version','architecture','url','sha256','size','target','build','purpose','check','revision','plugin_id'), ('module','id','format','version','architecture','url','sha256','size','purpose'))
         string(d['id'], ID); string(d['version']); string(d['sha256'], SHA); string(d['purpose'])
         from urllib.parse import urlsplit
         u = urlsplit(d['url'])
         if u.scheme != 'https' or not u.hostname or u.username or u.password or u.fragment: raise Error('URL externa inválida')
         if d['architecture'] not in ('x86_64','aarch64'): raise Error('Arquitectura externa inválida')
         if type(d['size']) is not int or not 0 < d['size'] <= 128*1024*1024: raise Error('Tamaño externo inválido')
-        if d['format'] not in ('appimage','tar','arch','source-tar'): raise Error('Formato no soportado; no se convierten deb/rpm')
-        if d['format'] != 'arch': destination(d.get('target', ''))
+        if d['format'] not in ('appimage','tar','arch','source-tar','omarchy-plugin'): raise Error('Formato no soportado; no se convierten deb/rpm')
+        if d['format']=='omarchy-plugin':
+            from .native_plugin import validate as plugin_validate
+            plugin_validate(d)
+            if version(data['manager_min'])<version('0.3.2'): raise Error('Plugin externo requiere manager_min 0.3.2')
+        elif d['format'] != 'arch': destination(d.get('target', ''))
         if d['format'] in ('tar','source-tar') and not d['target'].startswith('.local/share/omapacks-content/'): raise Error('Archivo de aplicación fuera del namespace')
         if d['format'] == 'source-tar':
             string(d.get('revision'),r'[0-9a-f]{40}')

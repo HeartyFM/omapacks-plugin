@@ -1,4 +1,5 @@
 {
   "repository": "HeartyFM/omapacks-config",
-  "manager_version": "0.2.1"
+  "manager_version": "0.3.3",
+  "manager_repository": "HeartyFM/omapacks-plugin"
 }

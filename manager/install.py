@@ -7,7 +7,8 @@ from omapacks import __version__
 from omapacks.config import Config,public_identity
 from omapacks.github import repository
 from omapacks.menu import integrate
-from omapacks.util import Error,atomic,require_user,secure_path,read_json,save_json
+from omapacks.util import Error,atomic,require_user,secure_path,read_json,save_json,lock
+from omapacks.diagnostics import safe
 
 ROOT=Path(__file__).resolve().parent
 
@@ -21,6 +22,14 @@ def preflight(repo,public_key):
     return public_identity(public_key)[1]
 
 def install(home,repo,public_key,yes=False):
+    preflight(repo,public_key)
+    from omapacks.engine import Engine
+    config=Config(home)
+    with lock(config.state):
+        if Engine(home,settings=config.data).pending(): raise Error('Hay contenido parcialmente aplicado. Revisa su recuperación antes de instalar el gestor.','partial')
+        return _install(home,repo,public_key,yes)
+
+def _install(home,repo,public_key,yes=False):
     fingerprint=preflight(repo,public_key)
     home=Path(home).absolute(); config=Config(home)
     target=secure_path(home,'.local/share/omapacks-manager'); launcher=home/'.local/bin/omapacks'
@@ -36,30 +45,57 @@ def install(home,repo,public_key,yes=False):
     parent=target.parent; parent.mkdir(parents=True,exist_ok=True)
     stage=Path(tempfile.mkdtemp(prefix='.omapacks-install-',dir=parent))
     old=target.with_name('.omapacks-manager.previous')
+    phase='copiar gestor'; activated=False; moved_previous=False
     try:
         for name in ('omapacks','bin'):
             shutil.copytree(ROOT/name,stage/name,ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
         for name in ('install.py','install.sh','uninstall.sh'):
             shutil.copy2(ROOT/name,stage/name)
-        save_json(stage/'omapacks-manager.json',{'version':__version__,'repository':repo})
-        if old.exists(): raise Error('Hay una instalación anterior incompleta: '+str(old))
-        if target.exists(): os.rename(target,old)
+        marker={'version':__version__,'repository':repo}
+        delivered=read_json(ROOT/'bundle.json',{})
+        if delivered.get('manager_repository'):
+            marker['manager_repository']=repository(delivered['manager_repository'])
+            shutil.copy2(public_key,stage/'publisher.pub')
+        save_json(stage/'omapacks-manager.json',marker)
+        if old.exists(): raise Error('Hay una instalación anterior incompleta: '+str(old)+'. Conservar ambas copias y revisar cuál está activa antes de recuperar; no borrarlas para reintentar.')
+        phase='activar copia del gestor'
+        if target.exists(): os.rename(target,old); moved_previous=True
         os.rename(stage,target)
+        activated=True; phase='guardar origen y confianza'
         config.configure(repo,public_key,system_files=config.data.get('system_files',[]),services=config.data.get('services',[]))
+        phase='crear acceso al gestor'
         launcher.parent.mkdir(parents=True,exist_ok=True)
         if not launcher.is_symlink(): launcher.symlink_to(target/'bin/omapacks')
-        integrate(home)
+        phase='integrar entradas Install/Update'; integrate(home)
         if old.exists(): shutil.rmtree(old)
-    except BaseException:
-        if old.exists():
+    except BaseException as e:
+        restored=False
+        # Only undo a rename performed by THIS invocation. An old directory
+        # already present on entry is evidence, never implicit permission to use it.
+        if moved_previous and old.exists():
             if target.exists(): shutil.rmtree(target)
             os.rename(old,target)
-        raise
+            restored=True
+        detail=('Fase: '+phase+'\nRecurso: gestor OmaPacks\nCausa: '+(safe(str(e)) or type(e).__name__)+
+                '\nAcciones: '+('se activó una copia nueva. ' if activated else 'sin activación nueva confirmada. ')+
+                ('Se recuperó la copia anterior del gestor. ' if restored else '')+
+                'Origen, confianza, acceso y menú deben comprobarse por separado si la fase había comenzado.\n'
+                'Siguiente paso: conservar el estado, comprobar el comando instalado, settings.json y las entradas Install/Update antes de reintentar. No se aplicó ningún pack en este paso.')
+        if isinstance(e,KeyboardInterrupt): print(detail,file=sys.stderr); raise
+        raise Error(detail,'installer') from e
     finally:
         if stage.exists(): shutil.rmtree(stage)
     print('Instalado. Abre Install → Configuración compartida.'); return True
 
 def uninstall(home,yes=False):
+    require_user()
+    from omapacks.engine import Engine
+    config=Config(home)
+    with lock(config.state):
+        if Engine(home,settings=config.data).pending(): raise Error('Hay contenido parcialmente aplicado. Revisa su recuperación antes de retirar el gestor.','partial')
+        return _uninstall(home,yes)
+
+def _uninstall(home,yes=False):
     require_user(); home=Path(home).absolute(); target=secure_path(home,'.local/share/omapacks-manager')
     if not (target/'omapacks-manager.json').is_file(): raise Error('Gestor no instalado en ese hogar')
     print('Se retirarán solo el gestor, su comando y sus dos entradas del menú.\nSe conservan configuración compartida, aplicaciones, origen, confianza, registros y respaldos.\nLa retirada del contenido es una decisión separada y requiere revisar un plan.')

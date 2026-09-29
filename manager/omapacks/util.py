@@ -62,7 +62,8 @@ class Runner:
         except (OSError, subprocess.TimeoutExpired) as e:
             raise Error(f'No se pudo ejecutar {argv[0]} ({type(e).__name__})', 'provider') from e
         if check and p.returncode:
-            raise Error(f'{argv[0]} terminó con {p.returncode}: {clean(p.stderr or p.stdout or "cancelado o rechazado")[-2500:]}', 'provider')
+            from .diagnostics import safe
+            raise Error(f'{argv[0]} terminó con {p.returncode}: {safe(p.stderr or p.stdout or "cancelado o rechazado")[-2500:]}', 'provider')
         return p
 
 @contextlib.contextmanager
