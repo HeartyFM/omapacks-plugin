@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "heartyfm.omapacks",
   "name": "OmaPacks · Configuración compartida",
-  "version": "0.4.0",
+  "version": "0.4.2",
   "kinds": [
     "service"
   ],

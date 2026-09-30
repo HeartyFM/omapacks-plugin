@@ -6,7 +6,7 @@ Es independiente del actualizador oficial de Omarchy.
 ## Si ya tienes OmaPacks
 
 Actualiza `heartyfm.omapacks` desde **Setup → Plugin → Update**. Después acepta
-la oferta **Actualizar gestor → 0.4.0**. Si la cerraste, ejecuta en una terminal:
+la oferta **Actualizar gestor → 0.4.2**. Si la cerraste, ejecuta en una terminal:
 
 ```sh
 python3 ~/.config/omarchy/plugins/heartyfm.omapacks/bootstrap.py --interactive
@@ -19,8 +19,8 @@ instalado y los respaldos permanecen; el pack se elige después desde
 `manager/LEEME.md`. Si una actualización de Git avisa de cambios locales,
 consérvalos y comunica el error, sin borrar la carpeta ni usar reset.
 
-La base de escritorio/gaming 1.2.0 necesita el gestor 0.4.0 y Omarchy
-4.0.4-1.1 o superior. Su publicación se anuncia por separado: que exista este
+La base de escritorio/gaming 1.2.3 necesita el gestor 0.4.2 para resolver
+Steam según el equipo de destino. No exige igualar la versión de Omarchy de Diego. Su publicación se anuncia por separado: que exista este
 plugin no implica que ya esté publicada una nueva configuración.
 
 ## Primera instalación

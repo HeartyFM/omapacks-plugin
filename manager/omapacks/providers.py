@@ -8,8 +8,9 @@ from .github import Transport
 from .diagnostics import Blocked,issue
 
 class Providers:
-    def __init__(self, runner=None, transport=None, package_lock='/var/lib/pacman/db.lck'):
+    def __init__(self, runner=None, transport=None, package_lock='/var/lib/pacman/db.lck', pci_root='/sys/bus/pci/devices'):
         self.runner = runner or Runner(); self.transport = transport or Transport(); self.package_lock = Path(package_lock)
+        self.pci_root = Path(pci_root)
 
     def installed(self, name):
         r = self.runner.run(['pacman','-Q','--',name], check=False)
@@ -84,6 +85,13 @@ class Providers:
 
     def _plan(self, manifest, staging):
         actions = []; packages = sorted(manifest.get('packages', []),key=lambda p: p['provider']=='flatpak')
+        from .steam import dependencies
+        automatic = {p['name']:p for p in dependencies(self,packages)}
+        declared = {p['name'] for p in packages if p['provider']=='arch'}
+        for name,p in automatic.items():
+            if name not in declared:
+                if any(x['name']==name for x in packages): raise Error('Proveedor distinto declarado para la biblioteca de Steam: '+name,'provider_mismatch')
+                packages.append(p)
         deferred=[]; remotes={}
         arch = []; existing = {}
         for p in packages:
@@ -162,11 +170,13 @@ class Providers:
                 name,v = row.split('\t',1)
                 if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9@._+:-]*',name): raise Error('Resolución de pacman inválida')
                 from .manifest import FORBIDDEN_PACKAGES
-                if FORBIDDEN_PACKAGES.search(name): raise Error('La transacción incluye una dependencia de sistema excluida: '+name)
-                actions.append({'provider':'arch','name':name,'version':v,'before':self.installed(name),'action':'install','requested':any(x.split('=')[0] == name for x in arch)})
+                if FORBIDDEN_PACKAGES.search(name): raise Error('La transacción incluye una dependencia de sistema excluida: '+name+'. Revisa los proveedores de dependencias; no se instala ni se elimina este bloqueo para continuar.')
+                actions.append({'provider':'arch','name':name,'version':v,'before':self.installed(name),'action':'install','requested':name in declared})
             if not any(a['provider']=='arch' and a['action']=='install' for a in actions): raise Error('Pacman no resolvió la transacción')
             missing={spec.split('=')[0] for spec in arch}-{a['name'] for a in actions if a['provider']=='arch'}
             if missing: raise Error('La resolución de pacman omitió paquetes solicitados: '+', '.join(sorted(missing)),'resolution')
+        for a in actions:
+            if a['provider']=='arch' and a['name'] in automatic: a['reason']=automatic[a['name']]['reason']
         actions.extend(remotes.values())
         if deferred: actions.append({'provider':'preparation','name':', '.join(deferred),'version':'pendiente de resolver','action':'replan','reason':'Después de instalar infraestructura/remotes se mostrará otro plan con aplicaciones, runtimes y permisos resueltos.'})
         for a in actions:
