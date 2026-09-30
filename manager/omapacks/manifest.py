@@ -8,7 +8,16 @@ from .util import Error, clean, relative, version
 ID = r'[a-z][a-z0-9._-]{0,79}'
 PKG = r'[a-zA-Z0-9][a-zA-Z0-9@._+:-]{0,150}'
 SHA = r'[0-9a-f]{64}'
-FORBIDDEN_PACKAGES = re.compile(r'^(linux(?:-|$)|.*(?:firmware|nvidia|bootloader)|grub$|systemd-boot$|cryptsetup$)', re.I)
+FORBIDDEN_PACKAGES = re.compile(r'^(linux(?:-|$)|.*(?:firmware|nvidia|bootloader)|grub$|limine(?:-|$)|systemd-boot$|cryptsetup$)', re.I)
+
+def omarchy_version(value):
+    """Omarchy numeric release + Arch package revision, including local hotfixes."""
+    if not isinstance(value,str) or not re.fullmatch(r'\d+\.\d+\.\d+(?:-\d+(?:\.\d+)*)?',value):
+        raise Error('Versión completa de Omarchy inválida o desconocida','incompatible')
+    base,_,release=value.partition('-')
+    parts=list(map(int,release.split('.'))) if release else [0]
+    while len(parts)>1 and parts[-1]==0: parts.pop()
+    return tuple(map(int,base.split('.'))),tuple(parts)
 
 def fields(obj, allowed, required=()):
     if not isinstance(obj, dict): raise Error('Se esperaba una tabla del manifiesto')
@@ -52,7 +61,7 @@ def destination(value, scope='user', kind='file'):
     return value
 
 def validate(data):
-    fields(data, ('schema','id','version','manager_min','compatibility','modules','packages','files','downloads','operations','checks','migrations','recovery','notes','flatpak_remotes','recipes','capture_shortcut'), ('schema','id','version','manager_min','compatibility','modules','recovery'))
+    fields(data, ('schema','id','version','manager_min','compatibility','modules','packages','files','downloads','operations','checks','migrations','recovery','notes','flatpak_remotes','recipes','capture_shortcut','package_removals','desktop_cleanup','spotify'), ('schema','id','version','manager_min','compatibility','modules','recovery'))
     if type(data['schema']) is not int or data['schema'] != 1: raise Error('Esquema de manifiesto no compatible')
     string(data['id'], ID); version(data['version']); version(data['manager_min'])
     if version(data['manager_min']) > version(__version__): raise Error('Esta release requiere actualizar el gestor por separado', 'incompatible')
@@ -62,7 +71,10 @@ def validate(data):
         if version(data['manager_min'])<version('0.3.2'): raise Error('Captura tipada requiere manager_min 0.3.2')
         if data['compatibility'].get('hyprland_format')!='lua': raise Error('Captura tipada requiere Hyprland Lua')
         if not any(c.get('kind')=='hyprland' and c.get('required') for c in data.get('checks',[])): raise Error('Captura tipada requiere comprobación Hyprland')
-    comp = data['compatibility']; fields(comp, ('architectures','omarchy_min','omarchy_max','hyprland_min','hyprland_max','hyprland_format'), ('architectures',))
+    comp = data['compatibility']; fields(comp, ('architectures','omarchy_min','omarchy_max','omarchy_package_min','hyprland_min','hyprland_max','hyprland_format'), ('architectures',))
+    if 'omarchy_package_min' in comp: omarchy_version(comp['omarchy_package_min'])
+    if any(name in data for name in ('package_removals','desktop_cleanup','spotify')) or 'omarchy_package_min' in comp:
+        if version(data['manager_min'])<version('0.4.0'): raise Error('La base escritorio/gaming requiere manager_min 0.4.0')
     strings(comp['architectures'], r'x86_64|aarch64')
     for name in ('omarchy_min','omarchy_max','hyprland_min','hyprland_max'):
         if name in comp: version(comp[name])
@@ -89,6 +101,22 @@ def validate(data):
         for item in data.get(section, []):
             if item.get('module') not in ids: raise Error('Módulo desconocido en ' + section)
     pkg_ids = set()
+    removals=data.get('package_removals',[])
+    if not isinstance(removals,list): raise Error('Retiradas de paquetes inválidas')
+    removal_names=set()
+    for removal in removals:
+        fields(removal,('module','name','reason'),('module','name','reason'))
+        if removal['module'] not in ids: raise Error('Módulo de retirada desconocido')
+        if removal['name'] not in ('cursor-bin','foot','moonlight-qt','signal-desktop'): raise Error('Retirada no admitida por esta receta acotada')
+        if removal['name'] in removal_names: raise Error('Retirada duplicada')
+        string(removal['reason']); removal_names.add(removal['name'])
+    if removal_names & {p.get('name') for p in data.get('packages',[])}: raise Error('No se puede instalar y retirar el mismo paquete')
+    if 'desktop_cleanup' in data:
+        from .desktop_apps import validate_cleanup
+        validate_cleanup(data['desktop_cleanup'])
+    if 'spotify' in data:
+        from .spotify import validate as spotify_validate
+        spotify_validate(data)
     for p in data.get('packages', []):
         fields(p, ('module','provider','name','version','remote','scope','commit','build_dependencies','review','permissions'), ('module','provider','name','version'))
         string(p['name'], PKG); string(p['version'], r'[a-zA-Z0-9][a-zA-Z0-9.:+_~-]*')
@@ -130,13 +158,14 @@ def validate(data):
         if u.scheme != 'https' or not u.hostname or u.username or u.password or u.fragment: raise Error('URL externa inválida')
         if d['architecture'] not in ('x86_64','aarch64'): raise Error('Arquitectura externa inválida')
         if type(d['size']) is not int or not 0 < d['size'] <= 128*1024*1024: raise Error('Tamaño externo inválido')
-        if d['format'] not in ('appimage','tar','arch','source-tar','omarchy-plugin'): raise Error('Formato no soportado; no se convierten deb/rpm')
+        if d['format'] not in ('appimage','tar','zip','arch','source-tar','omarchy-plugin'): raise Error('Formato no soportado; no se convierten deb/rpm')
+        if d['format']=='zip' and version(data['manager_min'])<version('0.4.0'): raise Error('ZIP requiere manager_min 0.4.0')
         if d['format']=='omarchy-plugin':
             from .native_plugin import validate as plugin_validate
             plugin_validate(d)
             if version(data['manager_min'])<version('0.3.2'): raise Error('Plugin externo requiere manager_min 0.3.2')
         elif d['format'] != 'arch': destination(d.get('target', ''))
-        if d['format'] in ('tar','source-tar') and not d['target'].startswith('.local/share/omapacks-content/'): raise Error('Archivo de aplicación fuera del namespace')
+        if d['format'] in ('tar','zip','source-tar') and not d['target'].startswith('.local/share/omapacks-content/'): raise Error('Archivo de aplicación fuera del namespace')
         if d['format'] == 'source-tar':
             string(d.get('revision'),r'[0-9a-f]{40}')
             if d.get('build') not in ('make','cargo'): raise Error('Constructor admitido: make o cargo')
@@ -175,6 +204,9 @@ def validate(data):
         elif c['kind'] == 'version':
             string(c.get('name'), r'wine|retroarch|dolphin-emu|python3|git|make|cargo')
         elif c['kind'] == 'hyprland': pass
+        elif c['kind']=='desktop-entry':
+            string(c.get('name'),r'[A-Za-z][A-Za-z0-9_.-]*\.desktop')
+            if version(data['manager_min'])<version('0.4.0'): raise Error('Comprobación de acceso requiere manager_min 0.4.0')
         elif c['kind'] == 'wine-prefix':
             relative(c.get('prefix')); 
             if not re.fullmatch(r'\.local/share/omapacks-data/wine/[a-z0-9_-]+',c['prefix']): raise Error('Prefijo Wine fuera de su namespace')
@@ -199,6 +231,11 @@ def load(path):
 def compatibility(manifest, host):
     c = manifest['compatibility']
     if host['architecture'] not in c['architectures']: raise Error('Arquitectura incompatible', 'incompatible')
+    if 'omarchy_package_min' in c:
+        actual=host.get('omarchy_package')
+        if actual is None: raise Error('No se pudo detectar la versión completa de Omarchy; ejecuta omapacks doctor antes de instalar.','incompatible')
+        if omarchy_version(actual)<omarchy_version(c['omarchy_package_min']):
+            raise Error('Omarchy '+actual+' es anterior a '+c['omarchy_package_min']+' (base de Diego). Actualiza Omarchy por su actualizador oficial y vuelve a abrir este pack; no se instalará ni aplicará contenido.','system_update')
     for name in ('omarchy','hyprland'):
         if name+'_min' in c or name+'_max' in c:
             actual = host.get(name)

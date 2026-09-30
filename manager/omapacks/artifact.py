@@ -1,5 +1,5 @@
 from __future__ import annotations
-import io, json, os, re, shutil, subprocess, tarfile, tempfile, tomllib
+import io, json, os, re, shutil, stat, subprocess, tarfile, tempfile, tomllib, zipfile
 from pathlib import Path
 from .util import Error, atomic, canonical, digest, relative, secure_path, clean, Runner
 from .manifest import load, fields, string, ID
@@ -9,6 +9,28 @@ from .github import repository
 
 MAX_FILES = 4096
 MAX_UNPACKED = 128 * 1024 * 1024
+
+def unpack_zip(data,destination,modes=None):
+    entries={}; seen=set(); total=0
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            for item in archive.infolist():
+                name=item.filename.rstrip('/') if item.is_dir() else item.filename
+                relative(name)
+                mode=item.external_attr>>16
+                if name in seen or len(seen)>=MAX_FILES or mode&0o7000 or (stat.S_IFMT(mode) not in (0,stat.S_IFREG,stat.S_IFDIR)):
+                    raise Error('ZIP con enlaces, permisos, duplicados o entradas no admitidas')
+                seen.add(name)
+                if item.is_dir(): continue
+                total+=item.file_size
+                if item.flag_bits&1 or item.file_size>16*1024*1024 or total>MAX_UNPACKED: raise Error('ZIP cifrado o demasiado grande')
+                body=archive.read(item)
+                if len(body)!=item.file_size: raise Error('ZIP truncado')
+                entries[name]=body
+                if modes is not None: modes[name]=0o755 if mode&0o111 else 0o644
+    except (zipfile.BadZipFile,RuntimeError,OSError) as e: raise Error('ZIP inválido','integrity') from e
+    for name,body in entries.items(): atomic(secure_path(destination,name),body)
+    return entries
 
 class ManagerRequired(Error):
     """Authenticated overview only. Never an executable content plan."""
@@ -109,7 +131,7 @@ def inspect_content(source):
             validate(entries[f['source']].decode(),manifest.get('packages',[]))
         elif f.get('kind')=='omarchy_shell':
             from .shell_config import validate
-            validate(entries[f['source']].decode(),manifest['files'])
+            validate(entries[f['source']].decode(),manifest['files'],manifest.get('downloads',[]))
         elif f.get('kind')=='omarchy_style':
             from .shell_style import validate
             validate(entries[f['source']].decode())

@@ -5,6 +5,18 @@ from .util import Error
 TARGET='.config/omarchy/shell.toml'
 TOKENS={'bar':{'background','background-alpha','text','active'},
         'menu':{'background','background-alpha','text','border','border-alpha','border-width','scrim','scrim-alpha','selected-background','selected-background-alpha','selected-text','selected-border','selected-border-alpha','selected-border-width'}}
+TOKENS.update({
+ 'controls':{state+'-'+part for state in ('normal','hover-cursor','focus','selected') for part in ('fill-alpha','border','border-alpha','border-width')}|{'pressed-fill-alpha','selection-fill-alpha'},
+ 'launcher':set(TOKENS['menu']),
+ 'popups':{'background-alpha','border','border-alpha','border-width'},
+ 'notifications':{'background-alpha','border','border-alpha','border-width'},
+ 'tooltip':{'background-alpha','border','border-alpha','border-width'},
+ 'polkit':{'background-alpha','border','border-alpha','border-width','scrim-alpha','border-error'},
+ 'lock':{'background-alpha','border','border-alpha','border-width','border-active','border-error','selection','selection-alpha'},
+ 'image-picker':{'scrim-alpha','selected-border','selected-border-alpha','unselected-border','unselected-border-alpha'},
+ 'glass':{'reflection-alpha'},
+ 'diego-panels':{'background-alpha','normal-fill-alpha','hover-fill-alpha','chosen-fill-alpha','chosen-hover-fill-alpha','normal-border-alpha','hover-border-alpha','chosen-border-alpha','chosen-hover-border-alpha'}
+})
 
 def parse(text):
     try: obj=tomllib.loads(text)
@@ -13,7 +25,7 @@ def parse(text):
 
 def validate(text):
     obj=parse(text); result={}
-    if not obj or set(obj)-set(TOKENS): raise Error('El estilo compartido solo puede cambiar bar y menu')
+    if not obj or set(obj)-set(TOKENS): raise Error('El estilo compartido solo puede cambiar superficies visuales declaradas')
     for section,values in obj.items():
         if not isinstance(values,dict) or set(values)-TOKENS[section]: raise Error('Token de estilo no admitido')
         for key,value in values.items():
@@ -21,7 +33,7 @@ def validate(text):
                 if type(value) not in (int,float) or not 0<=value<=1: raise Error('Alpha inválido')
             elif key.endswith('-width'):
                 if type(value) not in (int,float) or not 0<=value<=8: raise Error('Ancho inválido')
-            elif not isinstance(value,str) or not re.fullmatch(r'#[0-9a-fA-F]{6}(?: #[0-9a-fA-F]{6} [0-9]{1,3}deg)?',value): raise Error('Color/gradiente inválido')
+            elif not isinstance(value,str) or not re.fullmatch(r'(?:accent|background|foreground|#[0-9a-fA-F]{6}(?: #[0-9a-fA-F]{6} [0-9]{1,3}deg)?)',value): raise Error('Color/gradiente inválido')
             result[section+'.'+key]=value
     return result
 

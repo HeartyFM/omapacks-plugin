@@ -1,8 +1,0 @@
-__pycache__/
-*.pyc
-*.key
-*.pem
-signing_ed25519
-publisher_ed25519
-.env
-artifacts/

@@ -9,7 +9,11 @@ def detect(home, runner=None):
         try:
             r=runner.run(argv,check=False)
             m=re.search(r'\b(\d+\.\d+\.\d+)',r.stdout)
-            if m: result[name]=m.group(1)
+            if m:
+                result[name]=m.group(1)
+                if name=='omarchy':
+                    full=re.search(r'(?<!\S)(\d+\.\d+\.\d+(?:-\d+(?:\.\d+)*)?)(?!\S)',r.stdout.strip())
+                    if full: result['omarchy_package']=full[1]
         except Exception: pass
     # Binary version + primary configuration. Coexisting legacy files do not win.
     lua=Path(home)/'.config/hypr/hyprland.lua'; conf=Path(home)/'.config/hypr/hyprland.conf'

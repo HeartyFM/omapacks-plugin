@@ -1,7 +1,7 @@
 from __future__ import annotations
 import base64, copy, datetime as dt, json, os, pwd, re, shutil, tempfile, uuid
 from pathlib import Path
-from . import artifact, content_menu, preferences, hypr, shell_config, shell_style, native_plugin, capture_shortcut
+from . import artifact, content_menu, preferences, hypr, shell_config, shell_style, native_plugin, capture_shortcut, desktop_apps
 from .fs import Files
 from .host import detect
 from .manifest import compatibility, destination
@@ -45,10 +45,11 @@ class Engine:
     def preflight(self,stage,manifest):
         issues=[]
         try: compatibility(manifest,self.host)
-        except Error as e: issues.append(issue(e,'compatibilidad'))
+        except Error as e: raise Blocked([issue(e,'compatibilidad')]) from e
         if not self.providers_is_injected:
             commands=set()
-            if any(p['provider'] in ('arch','aur') for p in manifest.get('packages',[])): commands.update(('pacman','vercmp'))
+            if manifest.get('package_removals') or any(p['provider'] in ('arch','aur') for p in manifest.get('packages',[])): commands.update(('pacman','vercmp'))
+            if any(c['kind']=='desktop-entry' for c in manifest.get('checks',[])): commands.add('desktop-file-validate')
             if manifest.get('capture_shortcut') or any(f.get('kind')=='hypr_include' for f in manifest.get('files',[])): commands.update(('Hyprland','hyprctl'))
             if manifest.get('capture_shortcut'): commands.add('omarchy-capture-screenshot')
             if any(d['format']=='omarchy-plugin' for d in manifest.get('downloads',[])) or any(f.get('kind') in ('omarchy_shell','omarchy_style') for f in manifest.get('files',[])): commands.update(('omarchy-shell','omarchy-plugin-validate'))
@@ -72,6 +73,16 @@ class Engine:
         for op in manifest.get('operations',[]):
             if op['name'] not in self.settings.get('services',[]):
                 issues.append(issue(Error('Servicio no autorizado durante configuración administrativa: '+op['name']),op['name']))
+        if manifest.get('spotify') and not self.providers_is_injected:
+            from . import spotify
+            try:
+                if self.providers.installed('spotify'):
+                    declaration=next(f for f in manifest['files'] if f['target']==spotify.RES+'/native-transparency.json')
+                    native=spotify.validate_native(secure_path(Path(stage)/'content',declaration['source']).read_text())
+                    for name,entry in native['files'].items():
+                        if spotify.file_hash(Path('/opt/spotify')/name)!=entry['original_sha256']:
+                            raise Error('Spotify instalado requiere actualizar la receta OmarchyGlass; no se bajan versiones ni se aplican parches desconocidos.','incompatible')
+            except (Error,OSError) as e: issues.append(issue(e,'Spotify OmarchyGlass'))
         try: actions=self.providers.plan(manifest,stage)
         except Blocked as e: issues.extend(e.issues)
         except Error as e: issues.append(issue(e,'dependencias'))
@@ -99,6 +110,13 @@ class Engine:
         def put(scope,target,data,mode=0o644,kind='file',**extra):
             k=key(scope,target)
             if k in wanted: raise Error('Dos recursos intentan administrar el mismo destino: '+target)
+            if kind in ('desktop_hidden','spotify_launcher'):
+                prior=installed.get('files',{}).get(k,{})
+                if 'override_baseline' in prior: baseline=prior['override_baseline']
+                else:
+                    original=self.storage(scope).read(target)
+                    baseline={'data':base64.b64encode(original[0]).decode(),'mode':original[1]} if original else None
+                extra['override_baseline']=baseline
             wanted[k]={'scope':scope,'target':target,'data':base64.b64encode(data).decode(),'after':{'sha256':digest(data),'mode':mode},'kind':kind,**extra}
         for f in declarations:
             data=secure_path(stage/'content',f['source']).read_bytes() if f['source'] else b''
@@ -132,7 +150,7 @@ class Engine:
                     put('user',target,merged.encode(),current[1] if current else 0o644,'xdg_defaults',owned_values=values,baseline_values=baseline,owned_conflict=conflict,owned_before=preferences.read(original,preferences.PATHS[target]))
             elif f.get('kind') in ('omarchy_shell','omarchy_style'):
                 handler=shell_config if f['kind']=='omarchy_shell' else shell_style
-                values=handler.validate(data.decode(),manifest['files']) if handler is shell_config else handler.validate(data.decode())
+                values=handler.validate(data.decode(),manifest['files'],manifest.get('downloads',[])) if handler is shell_config else handler.validate(data.decode())
                 if handler is shell_config:
                     shell_values.update(values); continue
                 current=self.files.read(f['target']); original=current[0].decode() if current else '{}\n' if handler is shell_config else ''
@@ -150,9 +168,10 @@ class Engine:
         for a in actions:
             if a['provider']!='external' or a['format']=='arch': continue
             if a['format']=='appimage': put('user',a['target'],Path(a['stage']).read_bytes(),0o755)
-            elif a['format']=='tar':
+            elif a['format'] in ('tar','zip'):
                 extracted=stage/('external-'+a['id'])
-                modes={}; resources=artifact.unpack(Path(a['stage']).read_bytes(),extracted,modes=modes)
+                modes={}; unpacker=artifact.unpack_zip if a['format']=='zip' else artifact.unpack
+                resources=unpacker(Path(a['stage']).read_bytes(),extracted,modes=modes)
                 for rel,data in resources.items():
                     target=a['target']+'/'+rel; destination(target)
                     put('user',target,data,modes[rel])
@@ -179,9 +198,17 @@ class Engine:
                 plugin_inventories[a['target']]=current
                 resources,review=native_plugin.resources(a,stage)
                 for rel,(body,mode) in resources.items(): put('user',a['target']+'/'+rel,body,mode)
-                shell_values['plugins:'+a['plugin_id']]={'id':a['plugin_id']}
+                plugin_manifest=json.loads(resources['manifest.json'][0])
+                if 'bar-widget' not in plugin_manifest['kinds']:
+                    shell_values.setdefault('plugins:'+a['plugin_id'],{'id':a['plugin_id']})
                 shell_values['disabledPlugins:'+a['plugin_id']]=False
                 code_reviews.append({'source':a['url'],'content':review,'notice':'Plugin externo fijado: '+a['plugin_id']+'. Código sin aislamiento dentro de Quickshell. Revisar antes de activar.'})
+        if manifest.get('desktop_cleanup'):
+            for name in desktop_apps.validate_cleanup(manifest['desktop_cleanup']):
+                put('user',desktop_apps.PREFIX+name,desktop_apps.hidden_entry(name),kind='desktop_hidden')
+        if manifest.get('spotify'):
+            from . import spotify
+            for target,(data,mode) in spotify.launchers(self.home).items(): put('user',target,data,mode,kind='spotify_launcher')
         if shell_values:
             current=self.files.read(shell_config.TARGET); original=current[0].decode() if current else '{}\n'
             old=installed.get('files',{}).get(key('user',shell_config.TARGET),{})
@@ -202,6 +229,10 @@ class Engine:
             else:
                 after=None; action='remove' if before else 'keep'
                 conflict=before is not None and before!=old['after']
+                if old.get('kind') in ('desktop_hidden','spotify_launcher') and before and old.get('override_baseline'):
+                    baseline=old['override_baseline']; data=base64.b64decode(baseline['data'])
+                    desired={'scope':scope,'target':target,'kind':'override_detach','data':baseline['data'],'after':{'sha256':digest(data),'mode':baseline['mode']}}
+                    after=desired['after']; action='keep' if before==after else 'modify'
                 if old.get('kind') in ('omarchy_shell','omarchy_style') and before:
                     original=store.read(target); handler=shell_config if old['kind']=='omarchy_shell' else shell_style
                     merged,conflict,_=handler.merge(original[0].decode(),{},old)
@@ -283,6 +314,7 @@ class Engine:
         reloads.sort(key=lambda r:r['component']=='hyprland')
         plan={'schema':1,'stage':str(stage),'identity':identity,'meta':meta,'manifest':manifest,'installed_before':installed,'host':self.host,'packages':actions,'files':changes,'operations':ops,'recipes':recipes,'builds':builds,'hypr_validation':hypr_validation,'reloads':reloads,'migrations':route,'code_reviews':code_reviews,'recovery':manifest['recovery'],'decisions':decisions,'home':str(self.home),'system_root':str(self.system_root)}
         plan['permissions']=copy.deepcopy(self.settings)
+        plan['spotify']=bool(manifest.get('spotify'))
         plan['plugin_inventories']=plugin_inventories
         plan['plugin_identities']=plugin_identities
         plan['capture_bindings']=capture_bindings
@@ -338,7 +370,7 @@ class Engine:
 
     def guard_environment(self,plan):
         if not self.providers_is_injected and self.home!=Path(pwd.getpwuid(os.getuid()).pw_dir):
-            effects=bool(plan['operations'] or plan.get('hypr_validation') or any(r['component']=='omarchy-shell' for r in plan.get('reloads',[])) or any(c['scope']=='system' for c in plan['files']) or any(a['action']!='keep' and (a['provider'] in ('arch','aur','flatpak','flatpak-remote') or a['provider']=='external' and a['format']=='arch') for a in plan['packages']))
+            effects=bool(plan['operations'] or plan.get('hypr_validation') or any(r['component']=='omarchy-shell' for r in plan.get('reloads',[])) or any(c['scope']=='system' for c in plan['files']) or any(a['action']!='keep' and (a['provider'] in ('arch','aur','arch-remove','flatpak','flatpak-remote') or a['provider']=='external' and a['format']=='arch') for a in plan['packages']))
             if effects: raise Error('Un hogar temporal no aísla pacman, servicios o Hyprland. Usa un entorno desechable real para esas pruebas; esta ejecución no los modificará.')
 
     def apply(self,plan,approved,*,progress=lambda s:None,verify_remote=None,interrupt_after=None):
@@ -350,6 +382,12 @@ class Engine:
             if verify_remote: verify_remote(plan['identity'])
             self.revalidate(plan)
             self.guard_environment(plan)
+            if any(c.get('decision') in ('keep','skip') and c['target'].startswith(shell_config.PREFIX) for c in plan['files']):
+                raise Error('No se activa ni retira una mezcla parcial de archivos de un plugin. Revisa el reemplazo completo o conserva la release previa.')
+            if plan.get('spotify'):
+                from . import spotify
+                if any(c.get('decision') in ('keep','skip') for c in plan['files'] if c['target'].startswith((spotify.RES+'/',spotify.TOOL+'/',spotify.MARKET.rsplit('/',1)[0]+'/')) or c['target'] in (spotify.DESKTOP,spotify.LAUNCHER)):
+                    raise Error('Spotify requiere recursos coherentes; no se prepara una mezcla de código conservado y nuevo.')
             for package in plan['packages']+plan['installed_before'].get('packages',[]):
                 if package.get('format')=='omarchy-plugin' and any(c.get('decision') in ('keep','skip') for c in plan['files'] if c['target'].startswith(package['target']+'/')):
                     raise Error('No se activa ni retira una mezcla parcial de código del plugin '+package['plugin_id']+'. Conserva la versión previa o revisa el reemplazo completo.')
@@ -363,7 +401,12 @@ class Engine:
                 # Lua is executable code. Only invoke its validator after approval, before activation.
                 self.runner.run(['Hyprland','--verify-config','--config',validation['syntax']])
             tx=self.state/'transactions'/uuid.uuid4().hex; tx.mkdir(parents=True,mode=0o700)
-            journal={'id':tx.name,'status':'applying','started':dt.datetime.now(dt.timezone.utc).isoformat(),'plan':plan,'files':[],'packages':[],'operations':[],'recipes':[],'checks':[],'reloads':[],'provider_stage':'not-started','error':None}
+            # Write the approved payload once. Rewriting a 20 MB executable in
+            # every journal event would turn a small app into gigabytes of I/O.
+            save_json(tx/'approved-plan.json',plan)
+            recovery_plan={k:v for k,v in plan.items() if k!='code_reviews'}
+            recovery_plan['files']=[{k:v for k,v in c.items() if k!='data'} for c in plan['files']]
+            journal={'id':tx.name,'status':'applying','started':dt.datetime.now(dt.timezone.utc).isoformat(),'plan':recovery_plan,'approved_plan_file':'approved-plan.json','files':[],'packages':[],'operations':[],'recipes':[],'checks':[],'reloads':[],'provider_stage':'not-started','error':None}
             def save(): save_json(tx/'journal.json',journal)
             def phase(name,resource='operación'):
                 journal['phase']=name; journal['resource']=resource; save()
@@ -404,6 +447,11 @@ class Engine:
                 for recipe in plan.get('recipes',[]):
                     phase('receta',recipe['id'])
                     result=self.run_recipe(recipe); journal['recipes'].append(result); save()
+                if plan.get('spotify'):
+                    from . import spotify
+                    phase('preparación de Spotify','copia privada OmarchyGlass, sin iniciar aplicaciones')
+                    result=spotify.prepare(self.home,self.runner)
+                    journal['spotify']=result; save()
                 for op in plan['operations']:
                     if op.get('skip'): continue
                     phase('servicio',op['name'])
@@ -475,15 +523,16 @@ class Engine:
                     if c['action'] in ('skip','keep') and c.get('decision') in ('skip','keep'):
                         partial=True
                         if c['key'] in plan['installed_before'].get('files',{}): managed[c['key']]=plan['installed_before']['files'][c['key']]
-                    elif c['after'] and c['kind'] not in ('hypr_detach','menu_detach','defaults_detach','shell_detach','style_detach'):
+                    elif c['after'] and c['kind'] not in ('hypr_detach','menu_detach','defaults_detach','shell_detach','style_detach','override_detach'):
                         managed[c['key']]={'scope':c['scope'],'target':c['target'],'after':c['after'],'kind':c['kind']}
-                        for field in ('menu_entries','menu_baseline','owned_values','baseline_values'):
+                        for field in ('menu_entries','menu_baseline','owned_values','baseline_values','override_baseline'):
                             if field in c: managed[c['key']][field]=c[field]
                 if partial:
                     journal['status']='partial'; journal['error']='Se conservaron/omitieron conflictos; la release completa no se marca instalada.'; save()
                     return journal
                 installed={'content_id':plan['manifest']['id'],'version':plan['manifest']['version'],'identity':plan['identity'],'meta':plan['meta'],'modules':plan['manifest']['modules'],'files':managed,'packages':plan['packages'],'epoch':plan['manifest']['recovery']['epoch'],'migrations':plan['installed_before'].get('migrations',[])+[m['id'] for m in plan['migrations']],'transaction':tx.name,'checks':journal['checks'],'recipes':journal['recipes'],'reloads':journal['reloads']}
                 if plan['manifest'].get('capture_shortcut'): installed['capture_shortcut']=plan['manifest']['capture_shortcut']
+                if plan.get('spotify'): installed['spotify']=True
                 save_json(self.state/'installed.json',installed)
                 journal['status']='complete'; save(); return journal
             except BaseException as e:
@@ -515,6 +564,8 @@ class Engine:
             elif c['kind']=='wine-prefix':
                 # Read-only diagnosis: never overwrite or implicitly create prefixes/saves.
                 p=secure_path(self.home,c['prefix']); ok=(p/'system.reg').is_file() and (p/'drive_c').is_dir(); detail='Estructura del prefijo Wine (no prueba aplicaciones Windows)'
+            elif c['kind']=='desktop-entry':
+                detail=desktop_apps.check(self.home,c['name'],self.runner); ok=True
             elif c['kind']=='hyprland':
                 r=self.runner.run(['hyprctl','configerrors'],check=False)
                 ok=r.returncode==0 and not r.stdout.strip(); detail=clean(r.stdout or r.stderr) or 'Hyprland sin errores reportados'

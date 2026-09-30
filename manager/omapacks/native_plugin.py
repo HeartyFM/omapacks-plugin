@@ -37,7 +37,7 @@ def identities(home,plugin):
 
 def validate(spec):
     plugin=spec.get('plugin_id','')
-    if not re.fullmatch(r'[a-z][a-z0-9_-]*(?:\.[a-z0-9_-]+){2,}',plugin) or plugin.startswith(('omarchy.','omapacks.','heartyfm.omapacks')):
+    if not re.fullmatch(r'[a-z][a-z0-9_-]*(?:\.[a-z0-9_-]+){1,}',plugin) or plugin.startswith(('omarchy.','omapacks.','heartyfm.omapacks')):
         raise Error('Identificador de plugin externo inválido o reservado')
     revision=spec.get('revision','')
     match=re.fullmatch(r'https://codeload.github.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/tar.gz/([0-9a-f]{40})',spec['url'])
@@ -61,8 +61,9 @@ def resources(spec,stage):
     except (KeyError,ValueError): raise Error('Plugin sin manifiesto válido')
     if manifest.get('id')!=spec['plugin_id'] or manifest.get('version')!=spec['version'] or manifest.get('schemaVersion')!=1:
         raise Error('Identidad o versión del plugin distinta de la receta')
-    if 'service' not in manifest.get('kinds',[]) or not isinstance(manifest.get('entryPoints'),dict):
-        raise Error('Este adaptador solo activa plugins con servicio; no cambia la barra')
+    kinds=manifest.get('kinds',[])
+    if not kinds or set(kinds)-{'service','overlay','bar-widget','panel'} or not isinstance(manifest.get('entryPoints'),dict):
+        raise Error('Tipo de plugin externo no admitido')
     for point in manifest['entryPoints'].values():
         relative(point)
         if point not in files: raise Error('Entry point del plugin ausente')

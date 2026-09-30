@@ -45,7 +45,7 @@ class Providers:
             row={'provider':a['provider'],'name':a.get('name',a.get('id')),
                  'before':a.get('before'),'planned':a.get('version'),'actual':None,'state':'unknown'}
             try:
-                if a['provider'] in ('arch','aur') or a['provider']=='external' and a['format']=='arch':
+                if a['provider'] in ('arch','aur','arch-remove') or a['provider']=='external' and a['format']=='arch':
                     row['actual']=self.installed(a['name'])
                 elif a['provider']=='flatpak':
                     r=self.runner.run(['flatpak','info','--'+a['scope'],'--show-commit',a['name']],check=False)
@@ -53,7 +53,8 @@ class Providers:
                     row['actual']=r.stdout.strip()
                 else:
                     observed.append(row); continue
-                row['state']='planned' if row['actual']==row['planned'] else 'before' if row['actual']==row['before'] else 'different'
+                expected=None if a['provider']=='arch-remove' else row['planned']
+                row['state']='planned' if row['actual']==expected else 'before' if row['actual']==row['before'] else 'different'
             except Error as e: row['diagnostic']=issue(e,row['name'],'recuperación')
             observed.append(row)
         return observed
@@ -134,7 +135,18 @@ class Providers:
                     b = path.read_bytes(); resources[rel] = digest(b)
                     review.append('--- '+rel+' ---\n'+clean(b.decode('utf-8',errors='replace')))
                 if 'PKGBUILD' not in resources: raise Error('AUR sin PKGBUILD')
+                # AUR can request replacement of another installed app. Require a
+                # separate review instead of allowing pacman -U to expand this plan.
+                conflicts=[]
+                if '.SRCINFO' in resources:
+                    for value in re.findall(r'^\s*conflicts(?:_\w+)?\s*=\s*(\S+)\s*$',(stage/'.SRCINFO').read_text(),re.M):
+                        conflict=re.split(r'[<>=]',value)[0]
+                        if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9@._+:-]*',conflict): raise Error('Conflicto AUR inválido')
+                        if conflict!=name: conflicts.append(conflict)
+                    for conflict in conflicts:
+                        if self.installed(conflict): raise Error('AUR '+name+' sustituiría '+conflict+'. Revisa primero esa retirada; no pertenece al plan autorizado.','conflict')
                 actions.append({'provider':'aur','name':name,'version':p['version'],'before':current,'action':'build','commit':actual,'stage':str(stage),'resources':resources,'review':'\n\n'.join(review),'review_note':p['review'],'build_dependencies':p.get('build_dependencies',[]),'reproducibility':'La revisión fija no fija fuentes VCS/remotas variables del PKGBUILD.'})
+                actions[-1]['conflicts']=conflicts
         if arch:
             if self.package_lock.exists(): raise Error('Pacman está bloqueado por otra operación. No se elimina db.lck.', 'locked')
             updates = self.runner.run(['pacman','-Qu'],check=False)
@@ -192,7 +204,23 @@ class Providers:
                     a['resolved'].append({'name':dep,'version':ver,'before':before})
                 if not a['resolved']: raise Error('No se pudo resolver el paquete externo')
             actions.append(a)
+        if not deferred: actions.extend(self.plan_removals(manifest.get('package_removals',[]),actions))
         return actions
+
+    def plan_removals(self,removals,actions):
+        selected=[]
+        for entry in removals:
+            current=self.installed(entry['name'])
+            if current: selected.append({'provider':'arch-remove','name':entry['name'],'before':current,'version':'ausente','action':'remove','reason':entry['reason']})
+        if not selected: return []
+        if self.package_lock.exists(): raise Error('Pacman bloqueado; no se preparan retiradas','locked')
+        names={a['name'] for a in selected}
+        if names & {a.get('name') for a in actions if a['provider'] in ('arch','aur')}: raise Error('Un paquete solicitado también está en la retirada')
+        query=self.runner.run(['pacman','-Rp','--print-format','%n\t%v','--',*sorted(names)],check=False)
+        if query.returncode: raise Error('No se pueden retirar los programas sin romper dependencias: '+clean(query.stderr),'removal')
+        rows={line.split('\t',1)[0]:line.split('\t',1)[1] for line in query.stdout.splitlines() if '\t' in line}
+        if rows!={a['name']:a['before'] for a in selected}: raise Error('La retirada incluye paquetes adicionales o versiones distintas; se detiene','removal')
+        return selected
 
     def execute(self, actions, callback):
         arch = [a for a in actions if a['provider']=='arch' and a['action']!='keep']
@@ -204,7 +232,7 @@ class Providers:
                 if self.installed(a['name']) != a['version']: raise Error('Verificación de paquete falló: '+a['name'], 'provider')
                 callback(a)
         for a in actions:
-            if a['action']=='keep' or a['provider'] in ('arch','external','preparation'): continue
+            if a['action']=='keep' or a['provider'] in ('arch','external','preparation','arch-remove'): continue
             if a['provider']=='aur':
                 for name,sha in a['resources'].items():
                     if digest(secure_path(a['stage'],name).read_bytes()) != sha: raise Error('Código AUR cambió tras revisión', 'changed')
@@ -225,6 +253,8 @@ class Providers:
                         if self.compare(info[1],a['version']) < 0: raise Error('Versión AUR construida insuficiente')
                         selected.append(str(p))
                 if len(selected)!=1: raise Error('Revisar paquetes divididos AUR: salida ambigua o ausente')
+                for conflict in a.get('conflicts',[]):
+                    if self.installed(conflict): raise Error('Apareció un conflicto AUR después del plan: '+conflict,'changed')
                 self.runner.run(['sudo','pacman','-U','--',*selected],interactive=True,timeout=None)
                 actual=self.installed(a['name'])
                 if not actual or self.compare(actual,a['version'])<0: raise Error('AUR no quedó instalado con la versión requerida')
@@ -251,6 +281,15 @@ class Providers:
                 if self.runner.run(['flatpak','info','--'+a['scope'],'--show-commit',a['name']]).stdout.strip()!=a['version']:
                     raise Error('Flatpak cambió durante la operación; estado parcial', 'changed')
             callback(a)
+        removals=[a for a in actions if a['provider']=='arch-remove']
+        if removals:
+            if self.package_lock.exists(): raise Error('Pacman bloqueado antes de retirar','locked')
+            declared=[{'name':a['name'],'reason':a['reason']} for a in removals]
+            if self.plan_removals(declared,[])!=removals: raise Error('La retirada cambió; se requiere otro plan','changed')
+            self.runner.run(['sudo','pacman','-R','--',*sorted(a['name'] for a in removals)],interactive=True,timeout=None)
+            for a in removals:
+                if self.installed(a['name']) is not None: raise Error('El paquete no se retiró: '+a['name'],'provider')
+                callback(a)
 
     def install_external_arch(self, a):
         if self.package_lock.exists(): raise Error('Pacman bloqueado', 'locked')

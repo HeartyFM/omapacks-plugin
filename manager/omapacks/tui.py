@@ -43,7 +43,7 @@ def plan_summary(plan):
 
 def needs_admin(plan):
     return (any(c['scope']=='system' and c['action'] not in ('keep','skip') for c in plan['files']) or
-            any(p['action']!='keep' and (p['provider'] in ('arch','aur') or p['provider']=='external' and p['format']=='arch' or p['provider'] in ('flatpak','flatpak-remote') and p['scope']=='system') for p in plan['packages']) or
+            any(p['action']!='keep' and (p['provider'] in ('arch','aur','arch-remove') or p['provider']=='external' and p['format']=='arch' or p['provider'] in ('flatpak','flatpak-remote') and p['scope']=='system') for p in plan['packages']) or
             any(op['scope']=='system' and not op.get('skip') for op in plan['operations']))
 
 def describe(plan):
@@ -54,15 +54,17 @@ def describe(plan):
     for mod in m['modules']: lines.append(f"  {mod['id']}: {previous.pop(mod['id'],'nuevo')} → {mod['version']}")
     for mod,v in previous.items(): lines.append(f'  {mod}: {v} → retirado')
     lines+=['','Paquetes y aplicaciones:']
-    actions={'keep':'conservar','install':'instalar','update':'actualizar','build':'compilar','add':'añadir','replan':'recalcular'}
+    actions={'keep':'conservar','install':'instalar','update':'actualizar','build':'compilar','add':'añadir','replan':'recalcular','remove':'DESINSTALAR (datos personales conservados)'}
     for p in plan['packages']:
-        lines.append(f"  {p['provider']} · {p.get('name',p.get('id'))} · {actions.get(p['action'],p['action'])} · {p.get('before') or 'ausente'} → {p['version']}")
+        destination='retirado' if p['action']=='remove' else p['version']
+        lines.append(f"  {p['provider']} · {p.get('name',p.get('id'))} · {actions.get(p['action'],p['action'])} · {p.get('before') or 'ausente'} → {destination}")
         for dep in p.get('resolved',[]): lines.append(f"    {dep['name']}: {dep['before'] or 'nuevo'} → {dep['version']}")
         if p.get('permissions'): lines.append('  Permisos Flatpak:\n'+p['permissions'])
         if p.get('reproducibility'): lines.append('  '+p['reproducibility'])
         if p.get('definition'): lines.append('  Nuevo remote (clave GPG incluida):\n'+p['definition'])
         if p.get('reason'): lines.append('  '+p['reason'])
     if not plan['packages']: lines.append('  Ninguno')
+    if plan.get('spotify'): lines+=['','Spotify: preparar copia privada, Spicetify, Marketplace y OmarchyGlass sin iniciar el reproductor.','La copia del sistema y las cuentas/preferencias personales se conservan. Las generaciones preparadas quedan en omapacks-data; la restauración de archivos no las elimina.']
     if plan.get('recipes'): lines+=['','Recetas y solucionadores:']
     for recipe in plan.get('recipes',[]): lines.append(f"  {recipe['id']} · {recipe['action']} · {recipe['purpose']} · {recipe['prefix']}")
     lines+=['','Archivos:']
@@ -83,7 +85,7 @@ def describe(plan):
             lines+=['','Entradas de menú compartidas:']
             for key,value in c['menu_entries'].items(): lines.append('  '+value['label']+' · '+(value.get('action') or 'submenú'))
         for owned,value in c.get('owned_values',{}).items():
-            if owned.startswith('plugins:'): lines+=['','Plugin activado como servicio: '+owned.split(':',1)[1], '  Conserva la barra y los otros plugins; acceso desde el lanzador de aplicaciones.']
+            if owned.startswith('plugins:'): lines+=['','Plugin habilitado en la shell: '+owned.split(':',1)[1], '  Activación según el tipo y los accesos declarados por el plugin.']
     if m.get('capture_shortcut'):
         lines+=['','Captura completa: Super+Shift+S → archivo de imagen, sin selector de región.',
                 'Atajo previo detectado: '+(', '.join(str(b[-1]) for b in plan.get('capture_bindings') or []) or 'ninguno'),
@@ -156,8 +158,11 @@ def report_text(row,plan,notice=''):
     if plan.get('builds') or any(p['provider']=='preparation' for p in plan['packages']): lines+=['La preparación requerirá revisar y aprobar otro plan.']
     conflicts=[c for c in plan['files'] if c['conflict'] and c.get('decision') not in ('keep','skip')]
     if conflicts: lines+=['',('Hay un conflicto personal.' if len(conflicts)==1 else f'Hay {len(conflicts)} conflictos personales.')+' Instalar permite resolverlos; después revisarás el nuevo reporte.']
-    deps=[p.get('name',p.get('id','dependencia')) for p in plan['packages'] if p['action']!='keep']
+    deps=[p.get('name',p.get('id','dependencia')) for p in plan['packages'] if p['action'] not in ('keep','remove')]
     lines+=['Dependencias: '+(', '.join(deps[:6])+(' y '+str(len(deps)-6)+' más en Detalles.' if len(deps)>6 else '') if deps else 'ninguna por instalar.')]
+    removed=[p['name'] for p in plan['packages'] if p['action']=='remove']
+    if removed: lines+=['DESINSTALAR: '+', '.join(removed)+'. Sin retirar otras dependencias ni borrar datos personales.']
+    if plan.get('spotify'): lines+=['Spotify se prepara sin abrirlo. Las aplicaciones se abren después, cuando tú las elijas.']
     if plan['operations']: lines+=['Servicios: '+', '.join(op['name'] for op in plan['operations'])+'.']
     if any(p.get('format')=='omarchy-plugin' for p in plan['packages']): lines+=['El plugin ejecutará código externo con tus permisos. Se pide revisarlo antes de instalar.']
     activation={'omarchy-shell':'actualizar paneles y plugins','hyprland':'recargar Hyprland','omarchy-menu':'actualizar el menú','defaults':'aplicar preferencias de aplicaciones'}
@@ -190,8 +195,10 @@ def approval_text(plan,decisions):
         name=('Super+Shift+S: captura completa' if decision=='replace' else 'Super+Shift+S: acción actual') if resource=='user:'+capture_shortcut.MAIN and plan['manifest'].get('capture_shortcut') else resource.split(':',1)[-1]
         lines.append(('Reemplazar · ' if decision=='replace' else 'Conservar · ')+name)
     if any(c.get('decision') in ('keep','skip') for c in plan['files']): lines+=['ATENCIÓN: se conservarán recursos que dejan la instalación parcial.']
-    dependencies=[p.get('name',p.get('id','dependencia')) for p in plan['packages'] if p['action']!='keep']
+    dependencies=[p.get('name',p.get('id','dependencia')) for p in plan['packages'] if p['action'] not in ('keep','remove')]
     if dependencies: lines+=['Por instalar: '+', '.join(dependencies)+'.']
+    removed=[p['name'] for p in plan['packages'] if p['action']=='remove']
+    if removed: lines+=['DESINSTALAR con esta confirmación: '+', '.join(removed)+'. Sus datos personales se conservan. Restaurar archivos no reinstala estos paquetes.']
     lines+=['','Permisos: '+('se pedirá autorización de administrador para operaciones concretas.' if needs_admin(plan) else 'usuario normal.')]
     if plan.get('builds') or plan['code_reviews'] or any(p['provider']=='aur' and p['action']=='build' for p in plan['packages']):
         lines+=['Al instalar autorizas el código incluido en esta versión, también el de terceros, con tus permisos y sin aislamiento. Puedes consultar las fuentes en Detalles.']
@@ -364,7 +371,9 @@ def _run(config,mode='install',client=None,engine=None,release_id=None):
         default=next((i for i,r in enumerate(rows) if r['id']==selected_id),None)
         if default is None: default=next((i for i,r in enumerate(rows) if not r.get('prerelease')),len(rows))
         selected=choose(labels+['Gestor y plugin','Salir'],'Selecciona una versión',default,highlights=(0,),previews=[report.preview(r.get('body','')) for r in rows])
-        if selected is None or selected==len(rows)+1: return 0
+        if selected is None or selected==len(rows)+1:
+            exit_prompt(True)
+            return 0
         if selected==len(rows): pager(manager_details(config),'Gestor, plugin y contenido'); continue
         row=rows[selected]; selected_id=row['id']
         if release_report(config,client,engine,row): return 0

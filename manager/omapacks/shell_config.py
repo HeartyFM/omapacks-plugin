@@ -21,14 +21,15 @@ def parse(text):
         if field in obj and (not isinstance(obj[field],list) or any(not isinstance(x,str) for x in obj[field])): raise Error('Lista de shell inválida: '+field)
     return obj
 
-def validate(text,files):
+def validate(text,files,downloads=()):
     obj=parse(text)
-    if set(obj)!={'bar','disabledPlugins','cloneSourceRestores'}: raise Error('El pack solo administra la barra y la activación de su menú')
+    if not {'bar','disabledPlugins','cloneSourceRestores'}<=set(obj) or set(obj)-{'bar','disabledPlugins','cloneSourceRestores','plugins'}: raise Error('El pack solo administra barra y activación de plugins declarados')
     bar=obj['bar']
     if not isinstance(bar,dict) or set(bar)-{'id','position','transparent','centerAnchor','dynamic','layout'}: raise Error('Configuración de barra no admitida')
     if not OWNED.fullmatch(str(bar.get('id',''))): raise Error('Barra fuera del namespace administrado')
     if bar.get('position') not in ('top','bottom','left','right') or type(bar.get('transparent')) is not bool: raise Error('Posición/transparencia inválida')
     declared={f['target'].split('/')[3] for f in files if f['target'].startswith(PREFIX) and f['target'].endswith('/manifest.json')}
+    declared.update(d['plugin_id'] for d in downloads if d['format']=='omarchy-plugin')
     def plugin_id(value):
         if not isinstance(value,str) or not (re.fullmatch(r'omarchy\.[a-z0-9._-]+',value) or value in declared): raise Error('Referencia a plugin no declarada')
     plugin_id(bar['id'])
@@ -60,11 +61,11 @@ def validate(text,files):
     def walk(value):
         if isinstance(value,dict):
             for k,v in value.items():
-                if k in ('id','centerAnchor') and isinstance(v,str) and (v.startswith('omarchy.') or v.startswith('omapacks.shared.')): refs.add(v)
+                if k in ('id','centerAnchor') and isinstance(v,str) and (v.startswith('omarchy.') or v in declared): refs.add(v)
                 walk(v)
         elif isinstance(value,list):
             for v in value: walk(v)
-        elif isinstance(value,str) and (value.startswith('omarchy.') or value.startswith('omapacks.shared.')): refs.add(value)
+        elif isinstance(value,str) and (value.startswith('omarchy.') or value in declared): refs.add(value)
     walk(bar)
     if any(not (r.startswith('omarchy.') or r in declared) for r in refs): raise Error('La barra necesita plugins declarados en el pack')
     for section in ('left','center','right'):
@@ -73,9 +74,22 @@ def validate(text,files):
         for item in values:
             if not isinstance(item,dict) or not isinstance(item.get('id'),str) or item['id'] not in refs: raise Error('Widget de barra inválido')
             if not (item['id'].startswith('omarchy.') or item['id'] in declared): raise Error('Widget externo no declarado')
-    if obj['disabledPlugins']!=['omarchy.menu'] or len(obj['cloneSourceRestores'])!=1 or not OWNED.fullmatch(obj['cloneSourceRestores'][0]) or obj['cloneSourceRestores'][0] not in declared: raise Error('Activación de menú fuera del perfil compartido')
+    replaceable={'omarchy.'+x for x in ('menu','clipboard','disk-speedtest','emojis','indicators','network','monitor','osd','reminders','speedtest','wifiqr','lock')}
+    if set(obj['disabledPlugins'])-replaceable or set(obj['cloneSourceRestores'])-declared: raise Error('Activación fuera del perfil compartido')
     # Store list memberships individually; no ownership over foreign plugins.
-    return {'bar':bar,'disabledPlugins:omarchy.menu':True,'cloneSourceRestores:'+obj['cloneSourceRestores'][0]:True}
+    values={'bar':bar}
+    values.update({'disabledPlugins:'+p:True for p in obj['disabledPlugins']})
+    values.update({'cloneSourceRestores:'+p:True for p in obj['cloneSourceRestores']})
+    entries=obj.get('plugins',[])
+    if not isinstance(entries,list): raise Error('Plugins compartidos inválidos')
+    seen=set()
+    for entry in entries:
+        if not isinstance(entry,dict) or entry.get('id') not in declared or entry['id'] in seen: raise Error('Plugin no declarado o repetido')
+        allowed={'id','design','boot'} if entry['id']=='io.github.sirjul1337.lock-explorer' else {'id'}
+        if set(entry)-allowed or entry.get('design','dayline')!='dayline' or entry.get('boot','terminal')!='terminal': raise Error('Opciones de plugin fuera del perfil revisado')
+        seen.add(entry['id']); values['plugins:'+entry['id']]=entry
+        values['disabledPlugins:'+entry['id']]=False
+    return values
 
 def read(obj,key):
     if ':' not in key: return copy.deepcopy(obj.get(key))

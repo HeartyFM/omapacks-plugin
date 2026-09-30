@@ -17,7 +17,8 @@ def parser():
     sub=p.add_subparsers(dest='command')
     t=sub.add_parser('tui'); t.add_argument('--mode',choices=['install','update'],default='install')
     t.add_argument('--release-id',type=int,help='Abrir un reporte nuevo tras actualizar el gestor; nunca reutiliza un plan')
-    sub.add_parser('status'); sub.add_parser('doctor'); sub.add_parser('releases')
+    sub.add_parser('status'); sub.add_parser('doctor'); sub.add_parser('releases'); sub.add_parser('support-report',help='Resumen de solo lectura para compartir con Diego')
+    spotify=sub.add_parser('spotify-launch',help='Abrir manualmente el Spotify compartido ya instalado'); spotify.add_argument('args',nargs=argparse.REMAINDER)
     c=sub.add_parser('configure'); c.add_argument('--repo',required=True); c.add_argument('--public-key',required=True); c.add_argument('--yes',action='store_true'); c.add_argument('--system-file',action='append',default=[]); c.add_argument('--service',action='append',default=[])
     f=sub.add_parser('fetch'); f.add_argument('release_id',type=int)
     pplan=sub.add_parser('plan'); pplan.add_argument('stage',type=Path); pplan.add_argument('--decisions',type=Path); pplan.add_argument('--output',type=Path)
@@ -80,6 +81,12 @@ def main(argv=None):
     elif cmd=='doctor':
         from .host import detect
         result={'manager':__version__,'host':detect(config.home),'requirements':{name:bool(shutil.which(name)) for name in ('python3','gum','ssh-keygen','omarchy','pacman')},'configured':bool(config.data.get('repository'))}
+    elif cmd=='spotify-launch':
+        from .spotify import launch
+        launch(config.home,args.args); return 0
+    elif cmd=='support-report':
+        from .support import report
+        result=report(config.home)
     elif cmd=='status':
         engine=Engine(config.home,settings=config.data); result={'manager':__version__,'installed':engine.installed(),'pending':[str(p) for p in engine.pending()]}
     elif cmd=='restore': result=Engine(config.home,settings=config.data).restore(args.transaction,args.yes)
